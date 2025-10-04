@@ -5,8 +5,8 @@ from collections import defaultdict
 
 class Server:
     def __init__(self):
-        self.ip = socket.gethostbyname(socket.gethostname())
-
+        # self.ip = socket.gethostbyname(socket.gethostname())
+        self.ip = "0.0.0.0"
         while 1:
             try:
                 self.port = int(input('Enter port number to run on --> '))
