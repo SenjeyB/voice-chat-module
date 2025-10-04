@@ -9,6 +9,8 @@ import math
 import struct
 import time
 import os
+import numpy as np
+from collections import defaultdict, deque
 
 from protocol import DataType, Protocol
 
@@ -34,15 +36,18 @@ class Client:
         self.chunk_size = 512
         self.audio_format = pyaudio.paInt16
         self.channels = 1
-        self.rate = 20000
-        self.threshold = 10
+        self.rate = 48000
+        self.threshold = 0
         self.short_normalize = (1.0 / 32768.0)
         self.swidth = 2
         self.timeout_length = 2
-
+        self.audio_buffers = defaultdict(deque)
+        self.buffer_lock = threading.Lock()
+        self.max_buffer_size = 10  # Maximum number of chunks to buffer per user
+        
         # initialise microphone recording
         self.p = pyaudio.PyAudio()
-        self.playing_stream = self.p.open(format=self.audio_format, channels=self.channels, rate=self.rate, output=True, frames_per_buffer=self.chunk_size)
+        self.playing_stream = self.p.open(format=self.audio_format, channels=self.channels, rate=self.rate, output=True, frames_per_buffer=self.chunk_size, stream_callback=self.audio_callback)
         self.recording_stream = self.p.open(format=self.audio_format, channels=self.channels, rate=self.rate, input=True, frames_per_buffer=self.chunk_size)
 
         # Termination handler
@@ -66,14 +71,37 @@ class Client:
         receive_thread = threading.Thread(target=self.receive_server_data).start()
         self.send_data_to_server()
 
+    def audio_callback(self, in_data, frame_count, time_info, status):
+        with self.buffer_lock:
+            mixed_audio = np.zeros(frame_count, dtype=np.int16)
+            users_talking = []
+            
+            for user_id, buffer in list(self.audio_buffers.items()):
+                if len(buffer) > 0:
+                    chunk = buffer.popleft()
+                    audio_array = np.frombuffer(chunk, dtype=np.int16)
+                    mixed_audio = mixed_audio.astype(np.int32) + audio_array.astype(np.int32)
+                    users_talking.append(user_id)
+                    
+                if len(buffer) == 0:
+                    del self.audio_buffers[user_id]
+
+            mixed_audio = np.clip(mixed_audio, -32768, 32767).astype(np.int16)
+            if users_talking:
+                print("Users talking: %s (room %s)         " % (', '.join(users_talking), self.room), end='\r')
+            
+            return (mixed_audio.tobytes(), pyaudio.paContinue)
+
     def receive_server_data(self):
         while self.connected:
             try:
                 data, addr = self.s.recvfrom(1026)
                 message = Protocol(datapacket=data)
                 if message.DataType == DataType.ClientData:
-                    self.playing_stream.write(message.data)
-                    print("User with id %s is talking (room %s)" % (message.head, message.room), end='\r')
+                    with self.buffer_lock:
+                        user_id = str(message.head)      
+                        if len(self.audio_buffers[user_id]) < self.max_buffer_size:
+                            self.audio_buffers[user_id].append(message.data)
 
                 elif message.DataType == DataType.Handshake or message.DataType == DataType.Terminate:
                     print(message.data.decode("utf-8"))
