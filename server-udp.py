@@ -1,5 +1,3 @@
-#!/usr/bin/python3
-
 import socket
 from protocol import DataType, Protocol
 from collections import defaultdict
