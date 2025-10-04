@@ -34,6 +34,8 @@ class Server:
                 self.handleMessage(message, addr)
             except socket.timeout:
                 pass
+            except ConnectionResetError:  # if someone leaves this error appears
+                pass
 
     def handleMessage(self, message, addr):
         if self.clients.get(addr, None) is None:
