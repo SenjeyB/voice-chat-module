@@ -72,25 +72,29 @@ class Client:
         self.send_data_to_server()
 
     def audio_callback(self, in_data, frame_count, time_info, status):
+        mixed_audio = np.zeros(frame_count, dtype=np.int16)
+        users_talking = []
+        
+        chunks_to_process = []
         with self.buffer_lock:
-            mixed_audio = np.zeros(frame_count, dtype=np.int16)
-            users_talking = []
-            
             for user_id, buffer in list(self.audio_buffers.items()):
                 if len(buffer) > 0:
                     chunk = buffer.popleft()
-                    audio_array = np.frombuffer(chunk, dtype=np.int16)
-                    mixed_audio = mixed_audio.astype(np.int32) + audio_array.astype(np.int32)
-                    users_talking.append(user_id)
+                    chunks_to_process.append((user_id, chunk))
                     
                 if len(buffer) == 0:
                     del self.audio_buffers[user_id]
+        
+        for user_id, chunk in chunks_to_process:
+            audio_array = np.frombuffer(chunk, dtype=np.int16)
+            mixed_audio = mixed_audio.astype(np.int32) + audio_array.astype(np.int32)
+            users_talking.append(user_id)
 
-            mixed_audio = np.clip(mixed_audio, -32768, 32767).astype(np.int16)
-            if users_talking:
-                print("Users talking: %s (room %s)         " % (', '.join(users_talking), self.room), end='\r')
-            
-            return (mixed_audio.tobytes(), pyaudio.paContinue)
+        mixed_audio = np.clip(mixed_audio, -32768, 32767).astype(np.int16)
+        if users_talking:
+            print("Users talking: %s (room %s)         " % (', '.join(users_talking), self.room), end='\r')
+        
+        return (mixed_audio.tobytes(), pyaudio.paContinue)
 
     def receive_server_data(self):
         while self.connected:
@@ -98,8 +102,8 @@ class Client:
                 data, addr = self.s.recvfrom(1026)
                 message = Protocol(datapacket=data)
                 if message.DataType == DataType.ClientData:
+                    user_id = str(message.head)
                     with self.buffer_lock:
-                        user_id = str(message.head)      
                         if len(self.audio_buffers[user_id]) < self.max_buffer_size:
                             self.audio_buffers[user_id].append(message.data)
 
@@ -107,6 +111,7 @@ class Client:
                     print(message.data.decode("utf-8"))
             except socket.timeout:
                 print("\033[2K", end="\r")  # clearing line
+                time.sleep(0.01)
             except Exception as err:
                 pass
 
@@ -147,11 +152,11 @@ class Client:
             data = self.recording_stream.read(self.chunk_size)
             if self.rms(data) >= self.threshold:
                 end = time.time() + self.timeout_length
-                try:
-                    message = Protocol(dataType=DataType.ClientData, room=self.room, data=data)
-                    self.s.sendto(message.out(), self.server)
-                except:
-                    pass
+            try:
+                message = Protocol(dataType=DataType.ClientData, room=self.room, data=data)
+                self.s.sendto(message.out(), self.server)
+            except:
+                pass
             current = time.time()
 
     def listen(self):
@@ -161,6 +166,8 @@ class Client:
                 rms_val = self.rms(inp)
                 if rms_val > self.threshold:
                     self.record()
+                else:
+                    time.sleep(0.01)
             except:
                 pass
 
