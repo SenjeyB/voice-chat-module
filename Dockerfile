@@ -5,7 +5,7 @@ WORKDIR /usr/src/app
 
 COPY . .
 
-RUN apt-get update && apt-get install -y portaudio19-dev python-pyaudio
+RUN apt-get update && apt-get install -y portaudio19-dev
 RUN pip install -r requirements.txt
 
 EXPOSE 3000/udp
