@@ -8,7 +8,7 @@ import struct
 import time
 import os
 import numpy as np
-from collections import defaultdict, deque
+from collections import deque
 
 from protocol import DataType, Protocol
 
@@ -39,11 +39,14 @@ class Client:
         self.short_normalize = (1.0 / 32768.0)
         self.swidth = 2
         self.timeout_length = 2
-        self.audio_buffers = defaultdict(deque)
+        self.audio_streams = {}
         self.buffer_lock = threading.Lock()
-        self.max_buffer_size = 10
-        self.min_buffer_size = 3
-        
+        self.max_buffer_size = 24
+        self.prebuffer_chunks = 4
+        self.fade_in_chunks = 3
+        self.fade_out_chunks = 4
+        self.silence_hold_chunks = 2
+
         # initialise microphone recording
         self.p = pyaudio.PyAudio()
         self.playing_stream = self.p.open(format=self.audio_format, channels=self.channels, rate=self.rate, output=True, frames_per_buffer=self.chunk_size, stream_callback=self.audio_callback)
@@ -70,44 +73,87 @@ class Client:
         receive_thread = threading.Thread(target=self.receive_server_data).start()
         self.send_data_to_server()
 
-    def audio_callback(self, in_data, frame_count, time_info, status):
-        mixed_audio = np.zeros(frame_count, dtype=np.int16)
-        users_talking = []
-        
-        chunks_to_process = []
-        with self.buffer_lock:
-            for user_id, buffer in list(self.audio_buffers.items()):
-                if len(buffer) >= self.min_buffer_size:
-                    chunk = buffer.popleft()
-                    chunks_to_process.append((user_id, chunk))
-                    
-                if len(buffer) == 0:
-                    del self.audio_buffers[user_id]
-        
-        for user_id, chunk in chunks_to_process:
-            audio_array = np.frombuffer(chunk, dtype=np.int16).copy()
-            
-            if len(audio_array) != frame_count:
-                if len(audio_array) < frame_count:
-                    padding = np.zeros(frame_count - len(audio_array), dtype=np.int16)
-                    audio_array = np.concatenate([audio_array, padding])
-                else:
-                    audio_array = audio_array[:frame_count]
-            
-            fade_length = min(64, len(audio_array) // 4)
-            fade_in = np.linspace(0, 1, fade_length)
-            fade_out = np.linspace(1, 0, fade_length)
-            audio_array[:fade_length] = (audio_array[:fade_length] * fade_in).astype(np.int16)
-            audio_array[-fade_length:] = (audio_array[-fade_length:] * fade_out).astype(np.int16)
-            
-            mixed_audio = mixed_audio.astype(np.int32) + audio_array.astype(np.int32)
-            users_talking.append(user_id)
+    def _get_stream_state(self, user_id):
+        state = self.audio_streams.get(user_id)
+        if state is None:
+            state = {
+                "buffer": deque(maxlen=self.max_buffer_size),
+                "started": False,
+                "fade_in_remaining": self.fade_in_chunks,
+                "fade_out_remaining": 0,
+                "last_chunk": np.zeros(self.chunk_size, dtype=np.float32),
+                "silence_chunks": 0,
+                "last_packet_time": time.monotonic(),
+            }
+            self.audio_streams[user_id] = state
+        return state
 
-        mixed_audio = np.clip(mixed_audio, -32768, 32767).astype(np.int16)
+    def audio_callback(self, in_data, frame_count, time_info, status):
+        mixed_audio = np.zeros(frame_count, dtype=np.float32)
+        users_talking = []
+        current_time = time.monotonic()
+        with self.buffer_lock:
+            users_to_remove = []
+            for user_id, state in list(self.audio_streams.items()):
+                buffer = state["buffer"]
+                if not state["started"] and len(buffer) >= self.prebuffer_chunks:
+                    state["started"] = True
+                    state["fade_in_remaining"] = self.fade_in_chunks
+                    state["fade_out_remaining"] = 0
+                    state["silence_chunks"] = 0
+                chunk_array = None
+                if state["started"] and len(buffer) > 0:
+                    chunk_bytes = buffer.popleft()
+                    audio_array = np.frombuffer(chunk_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+                    state["last_chunk"] = audio_array.copy()
+                    state["silence_chunks"] = 0
+                    chunk_array = audio_array
+                else:
+                    if state["started"]:
+                        state["silence_chunks"] += 1
+                        if state["silence_chunks"] <= self.silence_hold_chunks:
+                            chunk_array = state["last_chunk"]
+                        else:
+                            if state["fade_out_remaining"] == 0 and state["last_chunk"] is not None:
+                                state["fade_out_remaining"] = self.fade_out_chunks
+                            if state["fade_out_remaining"] > 0 and state["last_chunk"] is not None:
+                                factor = state["fade_out_remaining"] / self.fade_out_chunks
+                                chunk_array = state["last_chunk"] * factor
+                                state["fade_out_remaining"] -= 1
+                                if state["fade_out_remaining"] == 0 and len(buffer) == 0:
+                                    state["started"] = False
+                                    state["fade_in_remaining"] = self.fade_in_chunks
+                                    state["silence_chunks"] = 0
+                                    state["last_chunk"] = np.zeros(self.chunk_size, dtype=np.float32)
+                            else:
+                                chunk_array = None
+                    else:
+                        chunk_array = None
+
+                if chunk_array is None:
+                    if not state["started"] and len(buffer) == 0 and current_time - state["last_packet_time"] > 5:
+                        users_to_remove.append(user_id)
+                    continue
+
+                if state["fade_in_remaining"] > 0:
+                    factor = (self.fade_in_chunks - state["fade_in_remaining"] + 1) / self.fade_in_chunks
+                    chunk_array = chunk_array * factor
+                    state["fade_in_remaining"] -= 1
+
+                mixed_audio[:chunk_array.shape[0]] += chunk_array
+                users_talking.append(user_id)
+
+            for user_id in users_to_remove:
+                if user_id in self.audio_streams and not self.audio_streams[user_id]["started"] and len(self.audio_streams[user_id]["buffer"]) == 0:
+                    del self.audio_streams[user_id]
+
         if users_talking:
             print("Users talking: %s (room %s)         " % (', '.join(users_talking), self.room), end='\r')
-        
-        return (mixed_audio.tobytes(), pyaudio.paContinue)
+            mixed_audio /= max(1, len(users_talking))
+
+        mixed_audio = np.clip(mixed_audio, -1.0, 1.0)
+        mixed_output = (mixed_audio * 32767).astype(np.int16)
+        return (mixed_output.tobytes(), pyaudio.paContinue)
 
     def receive_server_data(self):
         while self.connected:
@@ -117,19 +163,19 @@ class Client:
                 if message.DataType == DataType.ClientData:
                     user_id = str(message.head)
                     with self.buffer_lock:
-                        if len(self.audio_buffers[user_id]) < self.max_buffer_size:
-                            self.audio_buffers[user_id].append(message.data)
-                        elif len(self.audio_buffers[user_id]) >= self.max_buffer_size:
-                            self.audio_buffers[user_id].clear()
+                        state = self._get_stream_state(user_id)
+                        state["buffer"].append(message.data)
+                        state["last_packet_time"] = time.monotonic()
+                        if not state["started"] and len(state["buffer"]) >= self.prebuffer_chunks:
+                            state["started"] = True
+                            state["fade_in_remaining"] = self.fade_in_chunks
+                            state["fade_out_remaining"] = 0
+                            state["silence_chunks"] = 0
 
                 elif message.DataType == DataType.Handshake or message.DataType == DataType.Terminate:
                     print(message.data.decode("utf-8"))
-                    with self.buffer_lock:
-                        for user_buffer in self.audio_buffers.values():
-                            user_buffer.clear()
-                        self.audio_buffers.clear()
             except socket.timeout:
-                print("\033[2K", end="\r")
+                print("\033[2K", end="\r")  # clearing line
                 time.sleep(0.01)
             except Exception as err:
                 pass
