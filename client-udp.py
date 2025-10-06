@@ -85,7 +85,7 @@ class Client:
                     del self.audio_buffers[user_id]
         
         for user_id, chunk in chunks_to_process:
-            audio_array = np.frombuffer(chunk, dtype=np.int16)
+            audio_array = np.frombuffer(chunk, dtype=np.int16).copy()
             
             if len(audio_array) != frame_count:
                 if len(audio_array) < frame_count:
