@@ -42,9 +42,7 @@ class Client:
         self.audio_buffers = defaultdict(deque)
         self.buffer_lock = threading.Lock()
         self.max_buffer_size = 10
-        self.target_buffer_size = 3
-        self.user_fade_state = {}
-        self.fade_samples = 128
+        self.min_buffer_size = 3
         
         # initialise microphone recording
         self.p = pyaudio.PyAudio()
@@ -73,53 +71,36 @@ class Client:
         self.send_data_to_server()
 
     def audio_callback(self, in_data, frame_count, time_info, status):
-        mixed_audio = np.zeros(self.chunk_size, dtype=np.int32)
+        mixed_audio = np.zeros(frame_count, dtype=np.int16)
         users_talking = []
         
         chunks_to_process = []
         with self.buffer_lock:
             for user_id, buffer in list(self.audio_buffers.items()):
-                if len(buffer) > 0:
-                    if len(buffer) > self.max_buffer_size * 0.8:
-                        buffer.popleft()
+                if len(buffer) >= self.min_buffer_size:
+                    chunk = buffer.popleft()
+                    chunks_to_process.append((user_id, chunk))
                     
-                    if len(buffer) >= self.target_buffer_size or (len(buffer) > 0 and user_id in self.user_fade_state):
-                        chunk = buffer.popleft()
-                        chunks_to_process.append((user_id, chunk))
-                    
-                if len(buffer) == 0 and user_id in self.user_fade_state:
+                if len(buffer) == 0:
                     del self.audio_buffers[user_id]
         
         for user_id, chunk in chunks_to_process:
             audio_array = np.frombuffer(chunk, dtype=np.int16)
             
-            if len(audio_array) != self.chunk_size:
-                if len(audio_array) < self.chunk_size:
-                    audio_array = np.pad(audio_array, (0, self.chunk_size - len(audio_array)), mode='constant')
+            if len(audio_array) != frame_count:
+                if len(audio_array) < frame_count:
+                    padding = np.zeros(frame_count - len(audio_array), dtype=np.int16)
+                    audio_array = np.concatenate([audio_array, padding])
                 else:
-                    audio_array = audio_array[:self.chunk_size]
+                    audio_array = audio_array[:frame_count]
             
-            if user_id not in self.user_fade_state:
-                self.user_fade_state[user_id] = {'fade_in_pos': 0, 'active': True}
+            fade_length = min(64, len(audio_array) // 4)
+            fade_in = np.linspace(0, 1, fade_length)
+            fade_out = np.linspace(1, 0, fade_length)
+            audio_array[:fade_length] = (audio_array[:fade_length] * fade_in).astype(np.int16)
+            audio_array[-fade_length:] = (audio_array[-fade_length:] * fade_out).astype(np.int16)
             
-            fade_state = self.user_fade_state[user_id]
-            if fade_state['fade_in_pos'] < self.fade_samples:
-                fade_curve = np.linspace(0, 1, self.fade_samples)
-                fade_in = np.ones(len(audio_array))
-                fade_len = min(self.fade_samples - fade_state['fade_in_pos'], len(audio_array))
-                fade_in[:fade_len] = fade_curve[fade_state['fade_in_pos']:fade_state['fade_in_pos'] + fade_len]
-                audio_array = (audio_array * fade_in).astype(np.int16)
-                fade_state['fade_in_pos'] += fade_len
-            
-            with self.buffer_lock:
-                if user_id not in self.audio_buffers or len(self.audio_buffers[user_id]) == 0:
-                    fade_curve = np.linspace(1, 0, self.fade_samples)
-                    fade_out = np.ones(len(audio_array))
-                    fade_len = min(self.fade_samples, len(audio_array))
-                    fade_out[-fade_len:] = fade_curve[:fade_len]
-                    audio_array = (audio_array * fade_out).astype(np.int16)
-            
-            mixed_audio += audio_array.astype(np.int32)
+            mixed_audio = mixed_audio.astype(np.int32) + audio_array.astype(np.int32)
             users_talking.append(user_id)
 
         mixed_audio = np.clip(mixed_audio, -32768, 32767).astype(np.int16)
@@ -138,23 +119,15 @@ class Client:
                     with self.buffer_lock:
                         if len(self.audio_buffers[user_id]) < self.max_buffer_size:
                             self.audio_buffers[user_id].append(message.data)
+                        elif len(self.audio_buffers[user_id]) >= self.max_buffer_size:
+                            self.audio_buffers[user_id].clear()
 
-                elif message.DataType == DataType.Handshake:
+                elif message.DataType == DataType.Handshake or message.DataType == DataType.Terminate:
                     print(message.data.decode("utf-8"))
-                
-                elif message.DataType == DataType.Terminate:
-                    print(message.data.decode("utf-8"))
-                    leaving_user = message.data.decode("utf-8")
                     with self.buffer_lock:
-                        users_to_clean = []
-                        for user_id in list(self.audio_buffers.keys()):
-                            users_to_clean.append(user_id)
-                        for user_id in users_to_clean:
-                            if user_id in self.audio_buffers:
-                                self.audio_buffers[user_id].clear()
-                                del self.audio_buffers[user_id]
-                            if user_id in self.user_fade_state:
-                                del self.user_fade_state[user_id]
+                        for user_buffer in self.audio_buffers.values():
+                            user_buffer.clear()
+                        self.audio_buffers.clear()
             except socket.timeout:
                 print("\033[2K", end="\r")
                 time.sleep(0.01)
