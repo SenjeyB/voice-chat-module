@@ -41,11 +41,19 @@ class Client:
         self.timeout_length = 2
         self.audio_streams = {}
         self.buffer_lock = threading.Lock()
-        self.max_buffer_size = 24
-        self.prebuffer_chunks = 4
-        self.fade_in_chunks = 3
-        self.fade_out_chunks = 4
-        self.silence_hold_chunks = 2
+        self.max_buffer_size = 48
+        self.prebuffer_chunks = 6
+        self.fade_in_chunks = 4
+        self.fade_out_chunks = 6
+        self.silence_hold_chunks = 0
+        self.crossfade_samples = min(96, self.chunk_size // 2)
+        if self.crossfade_samples > 0:
+            ramp = np.linspace(0.0, 1.0, self.crossfade_samples + 2, dtype=np.float32)[1:-1]
+            self.crossfade_fade_in = ramp
+            self.crossfade_fade_out = 1.0 - ramp
+        else:
+            self.crossfade_fade_in = np.array([], dtype=np.float32)
+            self.crossfade_fade_out = np.array([], dtype=np.float32)
 
         # initialise microphone recording
         self.p = pyaudio.PyAudio()
@@ -105,6 +113,13 @@ class Client:
                 if state["started"] and len(buffer) > 0:
                     chunk_bytes = buffer.popleft()
                     audio_array = np.frombuffer(chunk_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+                    if self.crossfade_samples > 0 and state["fade_out_remaining"] == 0:
+                        prev = state["last_chunk"]
+                        crossfade_len = min(self.crossfade_samples, prev.shape[0], audio_array.shape[0])
+                        if crossfade_len > 0:
+                            fade_out = self.crossfade_fade_out[:crossfade_len]
+                            fade_in = self.crossfade_fade_in[:crossfade_len]
+                            audio_array[:crossfade_len] = prev[-crossfade_len:] * fade_out + audio_array[:crossfade_len] * fade_in
                     state["last_chunk"] = audio_array.copy()
                     state["silence_chunks"] = 0
                     chunk_array = audio_array
@@ -117,7 +132,7 @@ class Client:
                             if state["fade_out_remaining"] == 0 and state["last_chunk"] is not None:
                                 state["fade_out_remaining"] = self.fade_out_chunks
                             if state["fade_out_remaining"] > 0 and state["last_chunk"] is not None:
-                                factor = state["fade_out_remaining"] / self.fade_out_chunks
+                                factor = state["fade_out_remaining"] / (self.fade_out_chunks + 1)
                                 chunk_array = state["last_chunk"] * factor
                                 state["fade_out_remaining"] -= 1
                                 if state["fade_out_remaining"] == 0 and len(buffer) == 0:
